@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: prescription-ocr-app
+    env: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: AIzaSyCK0zO_Sgwjf5V9Ml6NLdWs3Q0yboNWWT8
+        sync: false
+      - key: postgresql://neondb_owner:npg_pqV9mc8BYoti@ep-aged-butterfly-ae2dwqyf-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+        sync: false
