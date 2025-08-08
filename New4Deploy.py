@@ -1,9 +1,7 @@
-
-import streamlit as st
+import gradio as gr
 import torch
 import pytesseract
 from PIL import Image
-from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
 import numpy as np
 from docx import Document
 import tempfile
@@ -18,8 +16,10 @@ from datetime import datetime
 # === CONFIG ===
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("models/gemma-3n-e4b-it")
 
+# === Database ===
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -50,11 +50,11 @@ def save_to_neon_db(filename, raw_text, structured_text):
         conn.commit()
         cursor.close()
         conn.close()
-        st.success("✅ Saved to Neon DB.")
+        return "✅ Saved to Neon DB."
     except Exception as e:
-        st.error(f"❌ Failed to save to DB: {e}")
+        return f"❌ Failed to save to DB: {e}"
 
-# === OCR Functions ===
+# === OCR ===
 def get_ocr_data(image):
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
     word_data = []
@@ -79,21 +79,20 @@ def group_words_into_lines(word_data, line_threshold=15):
         lines.append(sorted(current_line, key=lambda x: x['left']))
     return lines
 
-# === Streamlit UI ===
-st.title("🩺 Handwritten Prescription Structuring")
-uploaded_file = st.file_uploader("Upload a Prescription Image or PDF", type=["jpg", "jpeg", "png", "pdf"])
+# === Main Extraction Logic ===
+def process_prescription(file):
+    if not file:
+        return None, None, "❌ Please upload a file first."
 
-# Create DB table if needed
-create_table_if_not_exists()
+    create_table_if_not_exists()
 
-if uploaded_file is not None:
-    file_ext = uploaded_file.name.split('.')[-1].lower()
-
+    file_ext = file.name.split('.')[-1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp_file:
-        tmp_file.write(uploaded_file.read())
+        tmp_file.write(file.read())
         temp_path = tmp_file.name
 
-    if uploaded_file.type == "application/pdf":
+    # Handle PDF
+    if file_ext == "pdf":
         pdf = fitz.open(temp_path)
         pix = pdf[0].get_pixmap(dpi=300)
         image_bytes = pix.tobytes("png")
@@ -101,22 +100,21 @@ if uploaded_file is not None:
     else:
         image = Image.open(temp_path).convert("RGB")
 
-    # OCR and structuring pipeline
+    # OCR
     word_data = get_ocr_data(image)
     lines = group_words_into_lines(word_data)
 
-    # Step 2: Save Raw Lines
-    doc = Document()
-    doc.add_heading('Raw Prescription Text', level=1)
-    for line in lines:
-        line_text = " ".join([word['text'] for word in line])
-        doc.add_paragraph(line_text)
-    raw_docx_path = "raw_prescription.docx"
-    doc.save(raw_docx_path)
-    st.success("✅ Raw text extracted and saved.")
-
-    # Step 3: Format via Gemini
     raw_text = "\n".join([" ".join([word['text'] for word in line]) for line in lines])
+
+    # Save raw docx
+    raw_doc = Document()
+    raw_doc.add_heading('Raw Prescription Text', level=1)
+    for line in lines:
+        raw_doc.add_paragraph(" ".join([word['text'] for word in line]))
+    raw_docx_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
+    raw_doc.save(raw_docx_path)
+
+    # Gemini Structuring
     prompt = f"""
 Here is a raw OCR extracted text from a handwritten medical prescription.
 
@@ -140,21 +138,41 @@ Here is the raw text:
 Return only the well-structured formatted result.
 """
     response = model.generate_content(prompt)
-    structured_text = response.text
+    structured_text = response.text.strip()
 
-    # Step 4: Save Structured Output
+    # Save structured docx
     structured_doc = Document()
     structured_doc.add_heading('Structured Prescription', level=1)
-    for paragraph in structured_text.strip().split("\n\n"):
+    for paragraph in structured_text.split("\n\n"):
         structured_doc.add_paragraph(paragraph.strip())
-    structured_docx_path = "structured_prescription.docx"
+    structured_docx_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
     structured_doc.save(structured_docx_path)
-    st.success("✅ Structured text generated and saved.")
 
-    # Step 5: Save to Neon
-    save_to_neon_db(uploaded_file.name, raw_text, structured_text)
+    # Save to DB
+    db_status = save_to_neon_db(file.name, raw_text, structured_text)
 
-    # Step 6: Downloads
-    st.download_button("📄 Download Raw Prescription", data=open(raw_docx_path, "rb").read(), file_name="raw_prescription.docx")
-    st.download_button("📑 Download Structured Prescription", data=open(structured_docx_path, "rb").read(), file_name="structured_prescription.docx")
+    return raw_docx_path, structured_docx_path, db_status
 
+# === Gradio UI ===
+with gr.Blocks() as demo:
+    gr.Markdown("## 🩺 Handwritten Prescription Structuring (Gradio)")
+
+    with gr.Row():
+        file_input = gr.File(label="Upload Prescription Image or PDF", file_types=[".jpg", ".jpeg", ".png", ".pdf"])
+    
+    start_btn = gr.Button("🚀 Start Extraction")
+
+    with gr.Row():
+        raw_download = gr.File(label="📄 Download Raw Prescription")
+        structured_download = gr.File(label="📑 Download Structured Prescription")
+    
+    db_status_output = gr.Textbox(label="Database Status", interactive=False)
+
+    start_btn.click(
+        process_prescription,
+        inputs=file_input,
+        outputs=[raw_download, structured_download, db_status_output]
+    )
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
