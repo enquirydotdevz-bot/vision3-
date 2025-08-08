@@ -22,4 +22,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 EXPOSE 8501
 
 # Run Streamlit app
-CMD ["streamlit", "run", "New4Deploy.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["sh", "-c", "streamlit run New4Deploy.py --server.port=$PORT --server.address=0.0.0.0"]
+
