@@ -1,9 +1,8 @@
-# Use an official Python base image
+# Use official Python base image
 FROM python:3.10-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    tesseract-ocr \
     poppler-utils \
     libgl1-mesa-glx \
     libglib2.0-0 \
@@ -12,15 +11,14 @@ RUN apt-get update && apt-get install -y \
 # Set work directory
 WORKDIR /app
 
-# Copy files
+# Copy all files
 COPY . .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose Streamlit port
-EXPOSE 8501
+# Expose Gradio default port
+EXPOSE 7860
 
-# Run Streamlit app
-CMD ["sh", "-c", "streamlit run New4Deploy.py --server.port=$PORT --server.address=0.0.0.0"]
-
+# Run Gradio app
+CMD ["python", "New4Deploy.py"]
