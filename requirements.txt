@@ -9,3 +9,4 @@ requests
 google-generativeai
 pytesseract
 python-docx
+pymupdf
