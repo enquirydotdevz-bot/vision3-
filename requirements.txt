@@ -1,10 +1,9 @@
-streamlit
+gradio
+transformers>=4.44.0
 torch
-pytesseract
 Pillow
-transformers>=4.30.0
-numpy
-python-docx
-PyMuPDF
-google-generativeai
+python-dotenv
+sqlalchemy
 psycopg2-binary
+requests
+google-generativeai
