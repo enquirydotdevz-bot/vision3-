@@ -175,4 +175,5 @@ with gr.Blocks() as demo:
     )
 
 if __name__ == "__main__":
+    demo = gr.Interface(fn=your_function, inputs="file", outputs="text")
     demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
