@@ -12,7 +12,8 @@ import psycopg2
 import io
 from urllib.parse import urlparse
 from datetime import datetime
-
+import time
+import cv2
 # === CONFIG ===
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -79,81 +80,123 @@ def group_words_into_lines(word_data, line_threshold=15):
         lines.append(sorted(current_line, key=lambda x: x['left']))
     return lines
 
-# === Main Extraction Logic ===
+# === Main Extraction Logic ==
 def process_prescription(file_path):
     """
-    Processes a prescription PDF/image uploaded via Gradio.
-    - Extracts text via OCR
-    - Structures it using Gemini
-    - Saves raw & structured DOCX files
-    - Stores results in Neon DB
+    Faster, optimized processing for Gradio uploads.
     """
+    start_total = time.time()
 
     if not file_path:
         return None, None, "❌ Please upload a file first."
 
-    create_table_if_not_exists()
+    try:
+        create_table_if_not_exists()
+    except Exception as e:
+        return None, None, f"❌ DB init failed: {e}"
 
-    # In Gradio, `file_path` is already a string path to the uploaded file
+    t0 = time.time()
+    # Determine extension
     file_ext = os.path.splitext(file_path)[-1].lower().strip(".")
-
-    # Copy to a safe temp file
+    # Copy uploaded file to temp (safe)
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp_file:
         with open(file_path, "rb") as f:
             tmp_file.write(f.read())
         temp_path = tmp_file.name
+    t1 = time.time()
 
-    # Handle PDF (convert first page to image)
+    # Convert PDF first page to image with smaller dpi (150)
     if file_ext == "pdf":
-        pdf = fitz.open(temp_path)
-        pix = pdf[0].get_pixmap(dpi=300)
-        image_bytes = pix.tobytes("png")
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        try:
+            pdf = fitz.open(temp_path)
+            pix = pdf[0].get_pixmap(dpi=150)   # <- lower DPI for speed
+            image_bytes = pix.tobytes("png")
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception as e:
+            return None, None, f"❌ PDF -> image failed: {e}"
     else:
         image = Image.open(temp_path).convert("RGB")
+    t2 = time.time()
 
-    # OCR processing
-    word_data = get_ocr_data(image)
-    lines = group_words_into_lines(word_data)
-    raw_text = "\n".join(
-        [" ".join([word['text'] for word in line]) for line in lines]
+    # Convert PIL -> OpenCV (numpy) for fast preprocessing
+    img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+    # Resize to max width (preserve aspect ratio) to reduce OCR time
+    max_width = 1500
+    h, w = img_cv.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        img_cv = cv2.resize(img_cv, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Grayscale + slight blur + adaptive threshold — faster and often more accurate
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    # optional denoising (only if images are noisy)
+    gray = cv2.medianBlur(gray, 3)
+    # adaptive threshold
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
     )
 
-    # Save raw DOCX
+    # Convert back to PIL image for pytesseract
+    preprocessed_pil = Image.fromarray(thresh)
+    t3 = time.time()
+
+    # OCR with optimized config
+    tesseract_config = r'--oem 3 --psm 6 -l eng'  # tune lang if needed
+    try:
+        # Use image_to_data to keep word positions (like before)
+        data = pytesseract.image_to_data(preprocessed_pil, output_type=pytesseract.Output.DICT, config=tesseract_config)
+    except Exception as e:
+        return None, None, f"❌ Tesseract OCR failed: {e}"
+    t4 = time.time()
+
+    # Build word_data (same structure as before)
+    word_data = []
+    n = len(data['text'])
+    for i in range(n):
+        conf = data.get('conf', [])[i]
+        text = data.get('text', [])[i]
+        if text and text.strip() and conf != '' and int(float(conf)) > 60:
+            x, y, w_box, h_box = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            word_data.append({'text': text, 'box': [x, y, x + w_box, y + h_box], 'top': y, 'left': x})
+    t5 = time.time()
+
+    # Group words into lines (reuse your function)
+    lines = group_words_into_lines(word_data)
+    raw_text = "\n".join([" ".join([w['text'] for w in line]) for line in lines])
+    t6 = time.time()
+
+    # Save raw DOCX (fast)
     raw_docx_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
     raw_doc = Document()
     raw_doc.add_heading('Raw Prescription Text', level=1)
     for line in lines:
         raw_doc.add_paragraph(" ".join([word['text'] for word in line]))
     raw_doc.save(raw_docx_path)
+    t7 = time.time()
 
-    # Gemini structuring prompt
+    # Gemini structuring — THIS can be the slowest step (network + model)
+    # You can add a short prompt to ask for compact output to speed it slightly.
     prompt = f"""
-Here is a raw OCR extracted text from a handwritten medical prescription.
+Convert this raw OCR text into a structured prescription with:
+Hospital Name, Patient Name, Age/Gender, Address, Date, Doctor Name & Degree,
+Diagnosis, Medications (dosage & timing), Instructions, Follow-up Advice.
 
-Please convert it into a **well-structured document** that includes:
-- Hospital Name
-- Patient Name
-- Age / Gender
-- Address
-- Date of Visit
-- Doctor Name & Degree
-- Diagnosis (if found)
-- Medications with dosage & timing
-- Instructions
-- Follow-up Advice (if any)
+Raw OCR text:
+\"\"\"{raw_text}\"\"\"
 
-Here is the raw text:
-\"\"\"
-{raw_text}
-\"\"\"
-
-Return only the well-structured formatted result.
+Return only the structured prescription.
 """
-
-    # Gemini API call
-    response = model.generate_content(prompt)
-    structured_text = response.text.strip()
+    try:
+        t_gemini_start = time.time()
+        response = model.generate_content(prompt)
+        structured_text = response.text.strip()
+        t_gemini_end = time.time()
+    except Exception as e:
+        return raw_docx_path, None, f"❌ Gemini structuring failed: {e}"
 
     # Save structured DOCX
     structured_docx_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
@@ -162,11 +205,25 @@ Return only the well-structured formatted result.
     for paragraph in structured_text.split("\n\n"):
         structured_doc.add_paragraph(paragraph.strip())
     structured_doc.save(structured_docx_path)
+    t8 = time.time()
 
-    # Save to Neon DB
-    db_status = save_to_neon_db(os.path.basename(file_path), raw_text, structured_text)
+    # Save to DB (keep it brief)
+    try:
+        db_status = save_to_neon_db(os.path.basename(file_path), raw_text, structured_text)
+    except Exception as e:
+        db_status = f"❌ DB save failed: {e}"
 
-    return raw_docx_path, structured_docx_path, db_status
+    total = time.time() - start_total
+
+    # Make a small timing summary for debugging (remove in production)
+    timing_summary = (
+        f"timings (s): copy={t1-t0:.2f}, pdf_to_img={t2-t1:.2f}, preprocess={t3-t2:.2f}, "
+        f"ocr={t4-t3:.2f}, build_words={t5-t4:.2f}, lines={t6-t5:.2f}, raw_save={t7-t6:.2f}, "
+        f"gemini={t_gemini_end-t_gemini_start:.2f}, structured_save={t8-t_gemini_end:.2f}, total={total:.2f}"
+    )
+
+    return raw_docx_path, structured_docx_path, f"{db_status} | {timing_summary}"
+
 
 
 # === Gradio UI ===
