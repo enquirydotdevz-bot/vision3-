@@ -80,18 +80,30 @@ def group_words_into_lines(word_data, line_threshold=15):
     return lines
 
 # === Main Extraction Logic ===
-def process_prescription(file):
-    if not file:
+def process_prescription(file_path):
+    """
+    Processes a prescription PDF/image uploaded via Gradio.
+    - Extracts text via OCR
+    - Structures it using Gemini
+    - Saves raw & structured DOCX files
+    - Stores results in Neon DB
+    """
+
+    if not file_path:
         return None, None, "❌ Please upload a file first."
 
     create_table_if_not_exists()
 
-    file_ext = file.name.split('.')[-1].lower()
+    # In Gradio, `file_path` is already a string path to the uploaded file
+    file_ext = os.path.splitext(file_path)[-1].lower().strip(".")
+
+    # Copy to a safe temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp_file:
-        tmp_file.write(file.read())
+        with open(file_path, "rb") as f:
+            tmp_file.write(f.read())
         temp_path = tmp_file.name
 
-    # Handle PDF
+    # Handle PDF (convert first page to image)
     if file_ext == "pdf":
         pdf = fitz.open(temp_path)
         pix = pdf[0].get_pixmap(dpi=300)
@@ -100,21 +112,22 @@ def process_prescription(file):
     else:
         image = Image.open(temp_path).convert("RGB")
 
-    # OCR
+    # OCR processing
     word_data = get_ocr_data(image)
     lines = group_words_into_lines(word_data)
+    raw_text = "\n".join(
+        [" ".join([word['text'] for word in line]) for line in lines]
+    )
 
-    raw_text = "\n".join([" ".join([word['text'] for word in line]) for line in lines])
-
-    # Save raw docx
+    # Save raw DOCX
+    raw_docx_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
     raw_doc = Document()
     raw_doc.add_heading('Raw Prescription Text', level=1)
     for line in lines:
         raw_doc.add_paragraph(" ".join([word['text'] for word in line]))
-    raw_docx_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
     raw_doc.save(raw_docx_path)
 
-    # Gemini Structuring
+    # Gemini structuring prompt
     prompt = f"""
 Here is a raw OCR extracted text from a handwritten medical prescription.
 
@@ -131,27 +144,30 @@ Please convert it into a **well-structured document** that includes:
 - Follow-up Advice (if any)
 
 Here is the raw text:
-\"\"\" 
-{raw_text} 
-\"\"\" 
+\"\"\"
+{raw_text}
+\"\"\"
 
 Return only the well-structured formatted result.
 """
+
+    # Gemini API call
     response = model.generate_content(prompt)
     structured_text = response.text.strip()
 
-    # Save structured docx
+    # Save structured DOCX
+    structured_docx_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
     structured_doc = Document()
     structured_doc.add_heading('Structured Prescription', level=1)
     for paragraph in structured_text.split("\n\n"):
         structured_doc.add_paragraph(paragraph.strip())
-    structured_docx_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
     structured_doc.save(structured_docx_path)
 
-    # Save to DB
-    db_status = save_to_neon_db(file.name, raw_text, structured_text)
+    # Save to Neon DB
+    db_status = save_to_neon_db(os.path.basename(file_path), raw_text, structured_text)
 
     return raw_docx_path, structured_docx_path, db_status
+
 
 # === Gradio UI ===
 with gr.Blocks() as demo:
