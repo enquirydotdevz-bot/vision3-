@@ -10,3 +10,4 @@ google-generativeai
 pytesseract
 python-docx
 PyMuPDF
+opencv-python
